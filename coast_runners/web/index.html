@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Coast Runners</title>
+  <style>
+    html, body { margin: 0; background: #111; }
+    #stage { width: 640px; height: 480px; }
+    ruffle-player { width: 640px; height: 480px; }
+  </style>
+  <script>
+    window.RufflePlayer = window.RufflePlayer || {};
+    window.RufflePlayer.config = {
+      autoplay: "on",
+      unmuteOverlay: "hidden",
+      splashScreen: false,
+      letterbox: "off",
+      allowScriptAccess: true,
+      logLevel: "warn",
+      warnOnUnsupportedContent: false,
+      maxExecutionDuration: 120
+    };
+  </script>
+  <script src="ruffle/ruffle.js"></script>
+</head>
+<body>
+  <div id="stage"></div>
+  <script src="host.js"></script>
+</body>
+</html>
