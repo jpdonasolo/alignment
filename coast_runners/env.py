@@ -7,6 +7,7 @@ import json
 import mimetypes
 import struct
 import threading
+import time
 import zlib
 from dataclasses import dataclass
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -177,18 +178,44 @@ class CoastRunners:
     the water shimmer, the HUD, birds, and planes. ``"full"`` draws them.
     ``None`` does not draw: ``image`` is black and ``last_png`` stays empty.
     Saving frames to disk is left to the caller.
+
+    ``renderer`` asks Ruffle for a drawing backend: ``"webgl"``, ``"canvas"``,
+    ``"wgpu-webgl"`` or ``"webgpu"``. ``None`` lets Ruffle choose. ``"canvas"``
+    does not work with this game: Ruffle's Canvas2D backend lacks
+    ``BitmapData.draw``. ``info`` reports the backend actually used and the WebGL GPU.
+
+    ``image_size`` is ``(width, height)`` of ``image``. The 640x480 screen is
+    shrunk in the browser before transfer, which makes each step cheaper.
+    ``grayscale=True`` returns one channel: ``image`` has shape ``(height, width, 1)``
+    instead of ``(height, width, 3)``.
     """
 
-    def __init__(self, headless: bool = True, render: str | None = "fast") -> None:
+    def __init__(
+        self,
+        headless: bool = True,
+        render: str | None = "fast",
+        renderer: str | None = None,
+        image_size: tuple[int, int] = (640, 480),
+        grayscale: bool = False,
+    ) -> None:
         if render not in ("fast", "full", None):
             raise ValueError(f"render must be 'fast', 'full', or None, got {render!r}")
+        if renderer not in ("webgpu", "wgpu-webgl", "webgl", "canvas", None):
+            raise ValueError(f"renderer must be 'webgpu', 'wgpu-webgl', 'webgl', 'canvas', or None, got {renderer!r}")
+        width, height = (int(value) for value in image_size)
+        if not (0 < width <= 640 and 0 < height <= 480):
+            raise ValueError(f"image_size must be (width, height) within (640, 480), got {image_size!r}")
         if not _SWF.is_file():
             raise FileNotFoundError(f"patched movie not found: {_SWF}")
         self.headless = headless
         self.render = render
+        self.image_size = (width, height)
+        self.grayscale = bool(grayscale)
+        self.image_shape = (height, width, 1 if self.grayscale else 3)
         self._frame: np.ndarray | None = None
         self._last_png: bytes | None = None
-        self._blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.last_timing: dict[str, float] = {}
+        self._blank = np.zeros(self.image_shape, dtype=np.uint8)
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _QuietHandler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -205,6 +232,9 @@ class CoastRunners:
         self._page.on("pageerror", lambda error: self._logs.append(f"pageerror: {error}"))
         mode = "off" if render is None else render
         page = f"/index.html?render={mode}"
+        if renderer is not None:
+            page += f"&renderer={renderer}"
+        page += f"&width={width}&height={height}&gray={1 if self.grayscale else 0}"
         self._page.goto(f"http://127.0.0.1:{port}{page}", wait_until="domcontentloaded", timeout=60000)
         self._page.wait_for_function("() => window.rlBooted || window.rlBootError", timeout=120000)
         error = self._page.evaluate("window.rlBootError")
@@ -218,6 +248,9 @@ class CoastRunners:
             self.close()
             tail = "\n".join(console[-40:])
             raise RuntimeError(f"{error}; logs={detail}\n{tail}")
+        # Moteur demandé, types de contextes réellement créés par Ruffle ("webgl", "webgl2", "2d"...)
+        # et GPU vu par WebGL (gpu["renderer"] contient "SwiftShader" si le rendu est logiciel).
+        self.info: dict = self._page.evaluate("window.rlInfo()")
 
     @property
     def last_png(self) -> bytes:
@@ -226,7 +259,8 @@ class CoastRunners:
         if self._frame is None:
             return b""
         if self._last_png is None:
-            self._last_png = encode_png(self._frame)
+            frame = self._frame if self._frame.shape[2] == 3 else np.repeat(self._frame, 3, axis=2)
+            self._last_png = encode_png(frame)
         return self._last_png
 
     def reset(self, level: int = 0) -> Observation:
@@ -249,8 +283,19 @@ class CoastRunners:
         )
 
     def _call(self, expression: str, arg) -> Observation:
+        started = time.perf_counter()
         payload = self._page.evaluate(expression, arg)
-        return self._observation(payload["state"], payload["image"])
+        returned = time.perf_counter()
+        observation = self._observation(payload["state"], payload["image"])
+        finished = time.perf_counter()
+        # Durées en ms de chaque phase du dernier appel (step ou reset). Rien n'est affiché ici.
+        timing = dict(payload.get("timing") or {})
+        timing["evaluate_total"] = (returned - started) * 1000
+        timing["transport"] = timing["evaluate_total"] - timing.get("js_total", 0.0)
+        timing["python_decode"] = (finished - returned) * 1000
+        timing["total"] = (finished - started) * 1000
+        self.last_timing = timing
+        return observation
 
     def close(self) -> None:
         browser = getattr(self, "_browser", None)
@@ -282,9 +327,11 @@ class CoastRunners:
                 raise RuntimeError("rendering was requested but the page returned no frame")
             raw = base64.b64decode(image_b64)
             flat = np.frombuffer(raw, dtype=np.uint8)
-            if flat.size != 480 * 640 * 4:
-                raise RuntimeError(f"expected a 480x640 frame, got {flat.size} bytes")
-            image = np.ascontiguousarray(flat.reshape(480, 640, 4)[:, :, :3])
+            expected = self.image_shape[0] * self.image_shape[1] * self.image_shape[2]
+            if flat.size != expected:
+                raise RuntimeError(f"expected a {self.image_shape} frame ({expected} bytes), got {flat.size} bytes")
+            # Déjà en RGB ou en gris. copy() rend le tableau modifiable (frombuffer sur bytes est en lecture seule).
+            image = flat.reshape(self.image_shape).copy()
             self._frame = image
             self._last_png = None
         return Observation(
@@ -316,19 +363,21 @@ class CoastRunnersGym(gymnasium.Env):
         headless: bool = True,
         render: str | None = "fast",
         render_mode: str | None = None,
+        image_size: tuple[int, int] = (640, 480),
+        grayscale: bool = False,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
         self._level = level
         self._frames = frames
-        self._env = CoastRunners(headless=headless, render=render)
+        self._env = CoastRunners(headless=headless, render=render, image_size=image_size, grayscale=grayscale)
         self._score = 0.0
         self._image: np.ndarray | None = None
         number = spaces.Box(low=-np.inf, high=np.inf, shape=(), dtype=np.float64)
         flag = spaces.Box(low=0.0, high=1.0, shape=(), dtype=np.float64)
         self.observation_space = spaces.Dict(
             {
-                "image": spaces.Box(low=0, high=255, shape=(480, 640, 3), dtype=np.uint8),
+                "image": spaces.Box(low=0, high=255, shape=self._env.image_shape, dtype=np.uint8),
                 "score": number,
                 "x": number,
                 "y": number,
